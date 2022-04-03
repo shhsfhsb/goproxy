@@ -383,7 +383,8 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxyWithHandler(https_proxy strin
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode != 200 {
-				resp, err := ioutil.ReadAll(resp.Body)
+				// to avoid DoS with read error, limit error to 40 MB, should be more than enough
+				resp, err := ioutil.ReadAll(io.LimitReader(resp.Body), 40*1000*1000)
 				if err != nil {
 					return nil, err
 				}
