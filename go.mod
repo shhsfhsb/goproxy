@@ -1,10 +1,16 @@
 module github.com/elazarl/goproxy
 
-go 1.23
+go 1.24.0
 
 require (
-	github.com/elazarl/goproxy/ext v0.0.0-20190711103511-473e67f1d7d2
-	golang.org/x/net v0.26.0
+	github.com/coder/websocket v1.8.14
+	github.com/stretchr/testify v1.11.1
+	golang.org/x/net v0.50.0
 )
 
-require golang.org/x/text v0.16.0 // indirect
+require (
+	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
+	golang.org/x/text v0.34.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
+)

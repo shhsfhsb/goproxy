@@ -8,58 +8,82 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
-	"image"
+	"html"
 	"io"
-	"io/ioutil"
+	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/elazarl/goproxy"
-	goproxy_image "github.com/elazarl/goproxy/ext/image"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-var acceptAllCerts = &tls.Config{InsecureSkipVerify: true}
-
-var noProxyClient = &http.Client{Transport: &http.Transport{TLSClientConfig: acceptAllCerts}}
-
-var https = httptest.NewTLSServer(nil)
-var srv = httptest.NewServer(nil)
-var fs = httptest.NewServer(http.FileServer(http.Dir(".")))
+var (
+	https = httptest.NewTLSServer(nil)
+	srv   = httptest.NewServer(nil)
+	fs    = httptest.NewServer(http.FileServer(http.Dir(".")))
+)
 
 type QueryHandler struct{}
 
 func (QueryHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	req.Body = http.MaxBytesReader(w, req.Body, 1024*1024)
 	if err := req.ParseForm(); err != nil {
 		panic(err)
 	}
-	io.WriteString(w, req.Form.Get("result"))
+	_, _ = io.WriteString(w, html.EscapeString(req.Form.Get("result")))
+}
+
+type HeadersHandler struct{}
+
+// This handlers returns a body with a string containing all the request headers it received.
+func (HeadersHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	var sb strings.Builder
+	for name, values := range req.Header {
+		for _, value := range values {
+			sb.WriteString(name)
+			sb.WriteString(": ")
+			sb.WriteString(value)
+			sb.WriteString(";")
+		}
+	}
+	_, _ = io.WriteString(w, sb.String())
 }
 
 func init() {
 	http.DefaultServeMux.Handle("/bobo", ConstantHanlder("bobo"))
 	http.DefaultServeMux.Handle("/query", QueryHandler{})
+	http.DefaultServeMux.Handle("/headers", HeadersHandler{})
 }
 
 type ConstantHanlder string
 
 func (h ConstantHanlder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	io.WriteString(w, string(h))
+	_, _ = io.WriteString(w, string(h))
 }
 
 func get(url string, client *http.Client) ([]byte, error) {
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	txt, err := ioutil.ReadAll(resp.Body)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	txt, err := io.ReadAll(resp.Body)
 	defer resp.Body.Close()
 	if err != nil {
 		return nil, err
@@ -67,7 +91,8 @@ func get(url string, client *http.Client) ([]byte, error) {
 	return txt, nil
 }
 
-func getOrFail(url string, client *http.Client, t *testing.T) []byte {
+func getOrFail(t *testing.T, url string, client *http.Client) []byte {
+	t.Helper()
 	txt, err := get(url, client)
 	if err != nil {
 		t.Fatal("Can't fetch url", url, err)
@@ -75,44 +100,60 @@ func getOrFail(url string, client *http.Client, t *testing.T) []byte {
 	return txt
 }
 
-func localFile(url string) string { return fs.URL + "/" + url }
-func localTls(url string) string  { return https.URL + url }
+func getCert(t *testing.T, c *tls.Conn) []byte {
+	t.Helper()
+	if err := c.HandshakeContext(context.Background()); err != nil {
+		t.Fatal("cannot handshake", err)
+	}
+	return c.ConnectionState().PeerCertificates[0].Raw
+}
+
+func localFile(url string) string {
+	return fs.URL + "/" + url
+}
 
 func TestSimpleHttpReqWithProxy(t *testing.T) {
-	client, s := oneShotProxy(goproxy.NewProxyHttpServer(), t)
+	client, s := oneShotProxy(goproxy.NewProxyHttpServer())
 	defer s.Close()
 
-	if r := string(getOrFail(srv.URL+"/bobo", client, t)); r != "bobo" {
+	if r := string(getOrFail(t, srv.URL+"/bobo", client)); r != "bobo" {
 		t.Error("proxy server does not serve constant handlers", r)
 	}
-	if r := string(getOrFail(srv.URL+"/bobo", client, t)); r != "bobo" {
+	if r := string(getOrFail(t, srv.URL+"/bobo", client)); r != "bobo" {
 		t.Error("proxy server does not serve constant handlers", r)
 	}
 
-	if string(getOrFail(https.URL+"/bobo", client, t)) != "bobo" {
+	if string(getOrFail(t, https.URL+"/bobo", client)) != "bobo" {
 		t.Error("TLS server does not serve constant handlers, when proxy is used")
 	}
 }
 
-func oneShotProxy(proxy *goproxy.ProxyHttpServer, t *testing.T) (client *http.Client, s *httptest.Server) {
+func oneShotProxy(proxy *goproxy.ProxyHttpServer) (client *http.Client, s *httptest.Server) {
 	s = httptest.NewServer(proxy)
 
 	proxyUrl, _ := url.Parse(s.URL)
-	tr := &http.Transport{TLSClientConfig: acceptAllCerts, Proxy: http.ProxyURL(proxyUrl)}
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		Proxy: http.ProxyURL(proxyUrl),
+	}
 	client = &http.Client{Transport: tr}
 	return
 }
 
 func TestSimpleHook(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
-	proxy.OnRequest(goproxy.SrcIpIs("127.0.0.1")).DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-		req.URL.Path = "/bobo"
-		return req, nil
-	})
-	client, l := oneShotProxy(proxy, t)
+	proxy.OnRequest(goproxy.SrcIpIs("127.0.0.1")).DoFunc(
+		func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+			req.URL.Path = "/bobo"
+			return req, nil
+		},
+	)
+	client, l := oneShotProxy(proxy)
 	defer l.Close()
 
-	if result := string(getOrFail(srv.URL+("/momo"), client, t)); result != "bobo" {
+	if result := string(getOrFail(t, srv.URL+"/momo", client)); result != "bobo" {
 		t.Error("Redirecting all requests from 127.0.0.1 to bobo, didn't work." +
 			" (Might break if Go's client sets RemoteAddr to IPv6 address). Got: " +
 			result)
@@ -125,10 +166,10 @@ func TestAlwaysHook(t *testing.T) {
 		req.URL.Path = "/bobo"
 		return req, nil
 	})
-	client, l := oneShotProxy(proxy, t)
+	client, l := oneShotProxy(proxy)
 	defer l.Close()
 
-	if result := string(getOrFail(srv.URL+("/momo"), client, t)); result != "bobo" {
+	if result := string(getOrFail(t, srv.URL+"/momo", client)); result != "bobo" {
 		t.Error("Redirecting all requests from 127.0.0.1 to bobo, didn't work." +
 			" (Might break if Go's client sets RemoteAddr to IPv6 address). Got: " +
 			result)
@@ -139,14 +180,14 @@ func TestReplaceResponse(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 		resp.StatusCode = http.StatusOK
-		resp.Body = ioutil.NopCloser(bytes.NewBufferString("chico"))
+		resp.Body = io.NopCloser(bytes.NewBufferString("chico"))
 		return resp
 	})
 
-	client, l := oneShotProxy(proxy, t)
+	client, l := oneShotProxy(proxy)
 	defer l.Close()
 
-	if result := string(getOrFail(srv.URL+("/momo"), client, t)); result != "chico" {
+	if result := string(getOrFail(t, srv.URL+"/momo", client)); result != "chico" {
 		t.Error("hooked response, should be chico, instead:", result)
 	}
 }
@@ -155,23 +196,23 @@ func TestReplaceReponseForUrl(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.OnResponse(goproxy.UrlIs("/koko")).DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 		resp.StatusCode = http.StatusOK
-		resp.Body = ioutil.NopCloser(bytes.NewBufferString("chico"))
+		resp.Body = io.NopCloser(bytes.NewBufferString("chico"))
 		return resp
 	})
 
-	client, l := oneShotProxy(proxy, t)
+	client, l := oneShotProxy(proxy)
 	defer l.Close()
 
-	if result := string(getOrFail(srv.URL+("/koko"), client, t)); result != "chico" {
+	if result := string(getOrFail(t, srv.URL+"/koko", client)); result != "chico" {
 		t.Error("hooked 'koko', should be chico, instead:", result)
 	}
-	if result := string(getOrFail(srv.URL+("/bobo"), client, t)); result != "bobo" {
+	if result := string(getOrFail(t, srv.URL+"/bobo", client)); result != "bobo" {
 		t.Error("still, bobo should stay as usual, instead:", result)
 	}
 }
 
 func TestOneShotFileServer(t *testing.T) {
-	client, l := oneShotProxy(goproxy.NewProxyHttpServer(), t)
+	client, l := oneShotProxy(goproxy.NewProxyHttpServer())
 	defer l.Close()
 
 	file := "test_data/panda.png"
@@ -179,8 +220,13 @@ func TestOneShotFileServer(t *testing.T) {
 	if err != nil {
 		t.Fatal("Cannot find", file)
 	}
-	if resp, err := client.Get(fs.URL + "/" + file); err == nil {
-		b, err := ioutil.ReadAll(resp.Body)
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, fs.URL+"/"+file, nil)
+	if err != nil {
+		t.Fatal("Cannot create request", err)
+	}
+	if resp, err := client.Do(req); err == nil {
+		b, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatal("got", string(b))
 		}
@@ -194,16 +240,22 @@ func TestOneShotFileServer(t *testing.T) {
 
 func TestContentType(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
-	proxy.OnResponse(goproxy.ContentTypeIs("image/png")).DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
-		resp.Header.Set("X-Shmoopi", "1")
-		return resp
-	})
+	proxy.OnResponse(goproxy.ContentTypeIs("image/png")).DoFunc(
+		func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+			resp.Header.Set("X-Shmoopi", "1")
+			return resp
+		},
+	)
 
-	client, l := oneShotProxy(proxy, t)
+	client, l := oneShotProxy(proxy)
 	defer l.Close()
 
 	for _, file := range []string{"test_data/panda.png", "test_data/football.png"} {
-		if resp, err := client.Get(localFile(file)); err != nil || resp.Header.Get("X-Shmoopi") != "1" {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, localFile(file), nil)
+		if err != nil {
+			t.Fatal("Cannot create request", err)
+		}
+		if resp, err := client.Do(req); err != nil || resp.Header.Get("X-Shmoopi") != "1" {
 			if err == nil {
 				t.Error("pngs should have X-Shmoopi header = 1, actually", resp.Header.Get("X-Shmoopi"))
 			} else {
@@ -212,8 +264,11 @@ func TestContentType(t *testing.T) {
 		}
 	}
 
-	file := "baby.jpg"
-	if resp, err := client.Get(localFile(file)); err != nil || resp.Header.Get("X-Shmoopi") != "" {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, localFile("baby.jpg"), nil)
+	if err != nil {
+		t.Fatal("Cannot create request", err)
+	}
+	if resp, err := client.Do(req); err != nil || resp.Header.Get("X-Shmoopi") != "" {
 		if err == nil {
 			t.Error("Non png images should NOT have X-Shmoopi header at all", resp.Header.Get("X-Shmoopi"))
 		} else {
@@ -222,207 +277,82 @@ func TestContentType(t *testing.T) {
 	}
 }
 
-func getImage(file string, t *testing.T) image.Image {
-	newimage, err := ioutil.ReadFile(file)
-	if err != nil {
-		t.Fatal("Cannot read file", file, err)
-	}
-	img, _, err := image.Decode(bytes.NewReader(newimage))
-	if err != nil {
-		t.Fatal("Cannot decode image", file, err)
-	}
-	return img
-}
-
-func readAll(r io.Reader, t *testing.T) []byte {
-	b, err := ioutil.ReadAll(r)
-	if err != nil {
-		t.Fatal("Cannot read", err)
-	}
-	return b
-}
-func readFile(file string, t *testing.T) []byte {
-	b, err := ioutil.ReadFile(file)
-	if err != nil {
-		t.Fatal("Cannot read", err)
-	}
-	return b
-}
-func fatalOnErr(err error, msg string, t *testing.T) {
-	if err != nil {
-		t.Fatal(msg, err)
-	}
-}
 func panicOnErr(err error, msg string) {
 	if err != nil {
-		println(err.Error() + ":-" + msg)
-		os.Exit(-1)
-	}
-}
-
-func compareImage(eImg, aImg image.Image, t *testing.T) {
-	if eImg.Bounds().Dx() != aImg.Bounds().Dx() || eImg.Bounds().Dy() != aImg.Bounds().Dy() {
-		t.Error("image sizes different")
-		return
-	}
-	for i := 0; i < eImg.Bounds().Dx(); i++ {
-		for j := 0; j < eImg.Bounds().Dy(); j++ {
-			er, eg, eb, ea := eImg.At(i, j).RGBA()
-			ar, ag, ab, aa := aImg.At(i, j).RGBA()
-			if er != ar || eg != ag || eb != ab || ea != aa {
-				t.Error("images different at", i, j, "vals\n", er, eg, eb, ea, "\n", ar, ag, ab, aa, aa)
-				return
-			}
-		}
-	}
-}
-
-func TestConstantImageHandler(t *testing.T) {
-	proxy := goproxy.NewProxyHttpServer()
-	//panda := getImage("panda.png", t)
-	football := getImage("test_data/football.png", t)
-	proxy.OnResponse().Do(goproxy_image.HandleImage(func(img image.Image, ctx *goproxy.ProxyCtx) image.Image {
-		return football
-	}))
-
-	client, l := oneShotProxy(proxy, t)
-	defer l.Close()
-
-	resp, err := client.Get(localFile("test_data/panda.png"))
-	if err != nil {
-		t.Fatal("Cannot get panda.png", err)
-	}
-
-	img, _, err := image.Decode(resp.Body)
-	if err != nil {
-		t.Error("decode", err)
-	} else {
-		compareImage(football, img, t)
-	}
-}
-
-func TestImageHandler(t *testing.T) {
-	proxy := goproxy.NewProxyHttpServer()
-	football := getImage("test_data/football.png", t)
-
-	proxy.OnResponse(goproxy.UrlIs("/test_data/panda.png")).Do(goproxy_image.HandleImage(func(img image.Image, ctx *goproxy.ProxyCtx) image.Image {
-		return football
-	}))
-
-	client, l := oneShotProxy(proxy, t)
-	defer l.Close()
-
-	resp, err := client.Get(localFile("test_data/panda.png"))
-	if err != nil {
-		t.Fatal("Cannot get panda.png", err)
-	}
-
-	img, _, err := image.Decode(resp.Body)
-	if err != nil {
-		t.Error("decode", err)
-	} else {
-		compareImage(football, img, t)
-	}
-
-	// and again
-	resp, err = client.Get(localFile("test_data/panda.png"))
-	if err != nil {
-		t.Fatal("Cannot get panda.png", err)
-	}
-
-	img, _, err = image.Decode(resp.Body)
-	if err != nil {
-		t.Error("decode", err)
-	} else {
-		compareImage(football, img, t)
+		slog.Error("Critical failure", "error", err, "context", msg)
+		os.Exit(1)
 	}
 }
 
 func TestChangeResp(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
-		resp.Body.Read([]byte{0})
-		resp.Body = ioutil.NopCloser(new(bytes.Buffer))
+		_, _ = resp.Body.Read([]byte{0})
+		resp.Body = io.NopCloser(new(bytes.Buffer))
 		return resp
 	})
 
-	client, l := oneShotProxy(proxy, t)
+	client, l := oneShotProxy(proxy)
 	defer l.Close()
 
-	resp, err := client.Get(localFile("test_data/panda.png"))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, localFile("test_data/panda.png"), nil)
+	if err != nil {
+		t.Fatal("Cannot create request", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ioutil.ReadAll(resp.Body)
-	_, err = client.Get(localFile("/bobo"))
+	_, _ = io.ReadAll(resp.Body)
+	req, err = http.NewRequestWithContext(context.Background(), http.MethodGet, localFile("/bobo"), nil)
+	if err != nil {
+		t.Fatal("Cannot create request", err)
+	}
+	_, err = client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-}
-func TestReplaceImage(t *testing.T) {
-	proxy := goproxy.NewProxyHttpServer()
-
-	panda := getImage("test_data/panda.png", t)
-	football := getImage("test_data/football.png", t)
-
-	proxy.OnResponse(goproxy.UrlIs("/test_data/panda.png")).Do(goproxy_image.HandleImage(func(img image.Image, ctx *goproxy.ProxyCtx) image.Image {
-		return football
-	}))
-	proxy.OnResponse(goproxy.UrlIs("/test_data/football.png")).Do(goproxy_image.HandleImage(func(img image.Image, ctx *goproxy.ProxyCtx) image.Image {
-		return panda
-	}))
-
-	client, l := oneShotProxy(proxy, t)
-	defer l.Close()
-
-	imgByPandaReq, _, err := image.Decode(bytes.NewReader(getOrFail(localFile("test_data/panda.png"), client, t)))
-	fatalOnErr(err, "decode panda", t)
-	compareImage(football, imgByPandaReq, t)
-
-	imgByFootballReq, _, err := image.Decode(bytes.NewReader(getOrFail(localFile("test_data/football.png"), client, t)))
-	fatalOnErr(err, "decode football", t)
-	compareImage(panda, imgByFootballReq, t)
-}
-
-func getCert(c *tls.Conn, t *testing.T) []byte {
-	if err := c.Handshake(); err != nil {
-		t.Fatal("cannot handshake", err)
-	}
-	return c.ConnectionState().PeerCertificates[0].Raw
 }
 
 func TestSimpleMitm(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
+	proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	proxy.OnRequest(goproxy.ReqHostIs(https.Listener.Addr().String())).HandleConnect(goproxy.AlwaysMitm)
 	proxy.OnRequest(goproxy.ReqHostIs("no such host exists")).HandleConnect(goproxy.AlwaysMitm)
 
-	client, l := oneShotProxy(proxy, t)
+	client, l := oneShotProxy(proxy)
 	defer l.Close()
 
-	c, err := tls.Dial("tcp", https.Listener.Addr().String(), &tls.Config{InsecureSkipVerify: true})
+	ctx := context.Background()
+	c, err := (&tls.Dialer{
+		Config: &tls.Config{InsecureSkipVerify: true},
+	}).DialContext(ctx, "tcp", https.Listener.Addr().String())
 	if err != nil {
 		t.Fatal("cannot dial to tcp server", err)
 	}
-	origCert := getCert(c, t)
-	c.Close()
+	tlsConn, ok := c.(*tls.Conn)
+	assert.True(t, ok)
+	origCert := getCert(t, tlsConn)
+	_ = c.Close()
 
-	c2, err := net.Dial("tcp", l.Listener.Addr().String())
+	c2, err := (&net.Dialer{}).DialContext(ctx, "tcp", l.Listener.Addr().String())
 	if err != nil {
 		t.Fatal("dialing to proxy", err)
 	}
-	creq, err := http.NewRequest("CONNECT", https.URL, nil)
-	//creq,err := http.NewRequest("CONNECT","https://google.com:443",nil)
+	creq, err := http.NewRequestWithContext(context.Background(), http.MethodConnect, https.URL, nil)
 	if err != nil {
 		t.Fatal("create new request", creq)
 	}
-	creq.Write(c2)
+	_ = creq.Write(c2)
 	c2buf := bufio.NewReader(c2)
 	resp, err := http.ReadResponse(c2buf, creq)
-	if err != nil || resp.StatusCode != 200 {
+	if err != nil || resp.StatusCode != http.StatusOK {
 		t.Fatal("Cannot CONNECT through proxy", err)
 	}
-	c2tls := tls.Client(c2, &tls.Config{InsecureSkipVerify: true})
-	proxyCert := getCert(c2tls, t)
+	c2tls := tls.Client(c2, &tls.Config{
+		InsecureSkipVerify: true,
+	})
+	proxyCert := getCert(t, c2tls)
 
 	if bytes.Equal(proxyCert, origCert) {
 		t.Errorf("Certificate after mitm is not different\n%v\n%v",
@@ -430,11 +360,30 @@ func TestSimpleMitm(t *testing.T) {
 			base64.StdEncoding.EncodeToString(proxyCert))
 	}
 
-	if resp := string(getOrFail(https.URL+"/bobo", client, t)); resp != "bobo" {
+	if resp := string(getOrFail(t, https.URL+"/bobo", client)); resp != "bobo" {
 		t.Error("Wrong response when mitm", resp, "expected bobo")
 	}
-	if resp := string(getOrFail(https.URL+"/query?result=bar", client, t)); resp != "bar" {
+	if resp := string(getOrFail(t, https.URL+"/query?result=bar", client)); resp != "bar" {
 		t.Error("Wrong response when mitm", resp, "expected bar")
+	}
+}
+
+func TestMitmMutateRequest(t *testing.T) {
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		// We inject a header in the request
+		req.Header.Set("Mitm-Header-Inject", "true")
+		return req, nil
+	})
+
+	client, l := oneShotProxy(proxy)
+	defer l.Close()
+
+	r := string(getOrFail(t, https.URL+"/headers", client))
+	if !strings.Contains(r, "Mitm-Header-Inject: true") {
+		t.Error("Expected response body to contain the MITM injected header. Got instead: ", r)
 	}
 }
 
@@ -446,29 +395,31 @@ func TestConnectHandler(t *testing.T) {
 		return goproxy.OkConnect, u.Host
 	})
 
-	client, l := oneShotProxy(proxy, t)
+	client, l := oneShotProxy(proxy)
 	defer l.Close()
-	if resp := string(getOrFail(https.URL+"/alturl", client, t)); resp != "althttps" {
+	if resp := string(getOrFail(t, https.URL+"/alturl", client)); resp != "althttps" {
 		t.Error("Proxy should redirect CONNECT requests to local althttps server, expected 'althttps' got ", resp)
 	}
 }
 
 func TestMitmIsFiltered(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
-	//proxy.Verbose = true
+	proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	proxy.OnRequest(goproxy.ReqHostIs(https.Listener.Addr().String())).HandleConnect(goproxy.AlwaysMitm)
-	proxy.OnRequest(goproxy.UrlIs("/momo")).DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-		return nil, goproxy.TextResponse(req, "koko")
-	})
+	proxy.OnRequest(goproxy.UrlIs("/momo")).DoFunc(
+		func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+			return nil, goproxy.TextResponse(req, "koko")
+		},
+	)
 
-	client, l := oneShotProxy(proxy, t)
+	client, l := oneShotProxy(proxy)
 	defer l.Close()
 
-	if resp := string(getOrFail(https.URL+"/momo", client, t)); resp != "koko" {
+	if resp := string(getOrFail(t, https.URL+"/momo", client)); resp != "koko" {
 		t.Error("Proxy should capture /momo to be koko and not", resp)
 	}
 
-	if resp := string(getOrFail(https.URL+"/bobo", client, t)); resp != "bobo" {
+	if resp := string(getOrFail(t, https.URL+"/bobo", client)); resp != "bobo" {
 		t.Error("But still /bobo should be bobo and not", resp)
 	}
 }
@@ -482,28 +433,12 @@ func TestFirstHandlerMatches(t *testing.T) {
 		panic("should never get here, previous response is no null")
 	})
 
-	client, l := oneShotProxy(proxy, t)
+	client, l := oneShotProxy(proxy)
 	defer l.Close()
 
-	if resp := string(getOrFail(srv.URL+"/", client, t)); resp != "koko" {
+	if resp := string(getOrFail(t, srv.URL+"/", client)); resp != "koko" {
 		t.Error("should return always koko and not", resp)
 	}
-}
-
-func constantHttpServer(content []byte) (addr string) {
-	l, err := net.Listen("tcp", "localhost:0")
-	panicOnErr(err, "listen")
-	go func() {
-		c, err := l.Accept()
-		panicOnErr(err, "accept")
-		buf := bufio.NewReader(c)
-		_, err = http.ReadRequest(buf)
-		panicOnErr(err, "readReq")
-		c.Write(content)
-		c.Close()
-		l.Close()
-	}()
-	return l.Addr().String()
 }
 
 func TestIcyResponse(t *testing.T) {
@@ -521,7 +456,7 @@ func TestIcyResponse(t *testing.T) {
 	panicOnErr(err, "dial")
 	defer c.Close()
 	req.WriteProxy(c)
-	raw, err := ioutil.ReadAll(c)
+	raw, err := io.ReadAll(c)
 	panicOnErr(err, "readAll")
 	if string(raw) != "ICY 200 OK\r\n\r\nblablabla" {
 		t.Error("Proxy did not send the malformed response received")
@@ -541,35 +476,90 @@ func (v VerifyNoProxyHeaders) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 func TestNoProxyHeaders(t *testing.T) {
 	s := httptest.NewServer(VerifyNoProxyHeaders{t})
-	client, l := oneShotProxy(goproxy.NewProxyHttpServer(), t)
+	client, l := oneShotProxy(goproxy.NewProxyHttpServer())
 	defer l.Close()
-	req, err := http.NewRequest("GET", s.URL, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, s.URL, nil)
 	panicOnErr(err, "bad request")
-	req.Header.Add("Connection", "close")
 	req.Header.Add("Proxy-Connection", "close")
 	req.Header.Add("Proxy-Authenticate", "auth")
 	req.Header.Add("Proxy-Authorization", "auth")
-	client.Do(req)
+	_, _ = client.Do(req)
 }
 
 func TestNoProxyHeadersHttps(t *testing.T) {
 	s := httptest.NewTLSServer(VerifyNoProxyHeaders{t})
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
-	client, l := oneShotProxy(proxy, t)
+	client, l := oneShotProxy(proxy)
 	defer l.Close()
-	req, err := http.NewRequest("GET", s.URL, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, s.URL, nil)
 	panicOnErr(err, "bad request")
-	req.Header.Add("Connection", "close")
 	req.Header.Add("Proxy-Connection", "close")
-	client.Do(req)
+	_, _ = client.Do(req)
+}
+
+type VerifyAcceptEncodingHeader struct {
+	ReceivedHeaderValue string
+}
+
+func (v *VerifyAcceptEncodingHeader) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	v.ReceivedHeaderValue = r.Header.Get("Accept-Encoding")
+}
+
+func TestAcceptEncoding(t *testing.T) {
+	v := VerifyAcceptEncodingHeader{}
+	s := httptest.NewServer(&v)
+	for i, tc := range []struct {
+		keepAcceptEncoding bool
+		disableCompression bool
+		acceptEncoding     string
+		expectedValue      string
+	}{
+		{false, false, "", "gzip"},
+		{false, false, "identity", "gzip"},
+		{false, true, "", ""},
+		{false, true, "identity", ""},
+		{true, false, "", "gzip"},
+		{true, false, "identity", "identity"},
+		{true, true, "", ""},
+		{true, true, "identity", "identity"},
+	} {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			proxy := goproxy.NewProxyHttpServer()
+			proxy.KeepAcceptEncoding = tc.keepAcceptEncoding
+			proxy.Tr.DisableCompression = tc.disableCompression
+			client, l := oneShotProxy(proxy)
+			defer l.Close()
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, s.URL, nil)
+			panicOnErr(err, "bad request")
+			// fully control the Accept-Encoding header we send to the proxy
+			tr, ok := client.Transport.(*http.Transport)
+			if !ok {
+				t.Fatal("invalid client transport")
+			}
+			tr.DisableCompression = true
+			if tc.acceptEncoding != "" {
+				req.Header.Add("Accept-Encoding", tc.acceptEncoding)
+			}
+			_, err = client.Do(req)
+			panicOnErr(err, "bad response")
+			if v.ReceivedHeaderValue != tc.expectedValue {
+				t.Errorf("%+v expected Accept-Encoding: %s, got %s", tc, tc.expectedValue, v.ReceivedHeaderValue)
+			}
+		})
+	}
 }
 
 func TestHeadReqHasContentLength(t *testing.T) {
-	client, l := oneShotProxy(goproxy.NewProxyHttpServer(), t)
+	client, l := oneShotProxy(goproxy.NewProxyHttpServer())
 	defer l.Close()
 
-	resp, err := client.Head(localFile("test_data/panda.png"))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, localFile("test_data/panda.png"), nil)
+	if err != nil {
+		t.Fatal("Cannot create request", err)
+	}
+
+	resp, err := client.Do(req)
 	panicOnErr(err, "resp to HEAD")
 	if resp.Header.Get("Content-Length") == "" {
 		t.Error("Content-Length should exist on HEAD requests")
@@ -577,7 +567,9 @@ func TestHeadReqHasContentLength(t *testing.T) {
 }
 
 func TestChunkedResponse(t *testing.T) {
-	l, err := net.Listen("tcp", ":10234")
+	ctx := context.Background()
+
+	l, err := (&net.ListenConfig{}).Listen(ctx, "tcp", ":10234")
 	panicOnErr(err, "listen")
 	defer l.Close()
 	go func() {
@@ -586,7 +578,7 @@ func TestChunkedResponse(t *testing.T) {
 			panicOnErr(err, "accept")
 			_, err = http.ReadRequest(bufio.NewReader(c))
 			panicOnErr(err, "readrequest")
-			io.WriteString(c, "HTTP/1.1 200 OK\r\n"+
+			_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\n"+
 				"Content-Type: text/plain\r\n"+
 				"Transfer-Encoding: chunked\r\n\r\n"+
 				"25\r\n"+
@@ -597,18 +589,18 @@ func TestChunkedResponse(t *testing.T) {
 				"con\r\n"+
 				"8\r\n"+
 				"sequence\r\n0\r\n\r\n")
-			c.Close()
+			_ = c.Close()
 		}
 	}()
 
-	c, err := net.Dial("tcp", "localhost:10234")
+	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", "localhost:10234")
 	panicOnErr(err, "dial")
 	defer c.Close()
-	req, _ := http.NewRequest("GET", "/", nil)
-	req.Write(c)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "/", nil)
+	_ = req.Write(c)
 	resp, err := http.ReadResponse(bufio.NewReader(c), req)
 	panicOnErr(err, "readresp")
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	panicOnErr(err, "readall")
 	expected := "This is the data in the first chunk\r\nand this is the second one\r\nconsequence"
 	if string(b) != expected {
@@ -618,51 +610,81 @@ func TestChunkedResponse(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 		panicOnErr(ctx.Error, "error reading output")
-		b, err := ioutil.ReadAll(resp.Body)
-		resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
 		panicOnErr(err, "readall onresp")
 		if enc := resp.Header.Get("Transfer-Encoding"); enc != "" {
 			t.Fatal("Chunked response should be received as plaintext", enc)
 		}
-		resp.Body = ioutil.NopCloser(bytes.NewBufferString(strings.Replace(string(b), "e", "E", -1)))
+		resp.Body = io.NopCloser(bytes.NewBufferString(strings.ReplaceAll(string(b), "e", "E")))
 		return resp
 	})
 
-	client, s := oneShotProxy(proxy, t)
+	client, s := oneShotProxy(proxy)
 	defer s.Close()
 
-	resp, err = client.Get("http://localhost:10234/")
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost:10234/", nil)
+	if err != nil {
+		t.Fatal("Cannot create request", err)
+	}
+
+	resp, err = client.Do(req)
 	panicOnErr(err, "client.Get")
-	b, err = ioutil.ReadAll(resp.Body)
+	b, err = io.ReadAll(resp.Body)
 	panicOnErr(err, "readall proxy")
-	if string(b) != strings.Replace(expected, "e", "E", -1) {
+	if string(b) != strings.ReplaceAll(expected, "e", "E") {
 		t.Error("expected", expected, "w/ e->E. Got", string(b))
 	}
 }
 
 func TestGoproxyThroughProxy(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
+	proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	proxy2 := goproxy.NewProxyHttpServer()
 	doubleString := func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
-		b, err := ioutil.ReadAll(resp.Body)
+		b, err := io.ReadAll(resp.Body)
 		panicOnErr(err, "readAll resp")
-		resp.Body = ioutil.NopCloser(bytes.NewBufferString(string(b) + " " + string(b)))
+		resp.Body = io.NopCloser(bytes.NewBufferString(string(b) + " " + string(b)))
 		return resp
 	}
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 	proxy.OnResponse().DoFunc(doubleString)
 
-	_, l := oneShotProxy(proxy, t)
+	_, l := oneShotProxy(proxy)
 	defer l.Close()
 
 	proxy2.ConnectDial = proxy2.NewConnectDialToProxy(l.URL)
 
-	client, l2 := oneShotProxy(proxy2, t)
+	client, l2 := oneShotProxy(proxy2)
 	defer l2.Close()
-	if r := string(getOrFail(https.URL+"/bobo", client, t)); r != "bobo bobo" {
+	if r := string(getOrFail(t, https.URL+"/bobo", client)); r != "bobo bobo" {
 		t.Error("Expected bobo doubled twice, got", r)
 	}
+}
 
+func TestHttpProxyAddrsFromEnv(t *testing.T) {
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	doubleString := func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		b, err := io.ReadAll(resp.Body)
+		panicOnErr(err, "readAll resp")
+		resp.Body = io.NopCloser(bytes.NewBufferString(string(b) + " " + string(b)))
+		return resp
+	}
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnResponse().DoFunc(doubleString)
+
+	_, l := oneShotProxy(proxy)
+	defer l.Close()
+
+	t.Setenv("https_proxy", l.URL)
+	proxy2 := goproxy.NewProxyHttpServer()
+
+	client, l2 := oneShotProxy(proxy2)
+	defer l2.Close()
+	if r := string(getOrFail(t, https.URL+"/bobo", client)); r != "bobo bobo" {
+		t.Error("Expected bobo doubled twice, got", r)
+	}
 }
 
 func TestGoproxyHijackConnect(t *testing.T) {
@@ -670,16 +692,25 @@ func TestGoproxyHijackConnect(t *testing.T) {
 	proxy.OnRequest(goproxy.ReqHostIs(srv.Listener.Addr().String())).
 		HijackConnect(func(req *http.Request, client net.Conn, ctx *goproxy.ProxyCtx) {
 			t.Logf("URL %+#v\nSTR %s", req.URL, req.URL.String())
-			resp, err := http.Get("http:" + req.URL.String() + "/bobo")
+			getReq, err := http.NewRequestWithContext(req.Context(), http.MethodGet, (&url.URL{
+				Scheme: "http",
+				Host:   req.URL.Host,
+				Path:   "/bobo",
+			}).String(), nil)
+			if err != nil {
+				t.Fatal("Cannot create request", err)
+			}
+			httpClient := &http.Client{}
+			resp, err := httpClient.Do(getReq)
 			panicOnErr(err, "http.Get(CONNECT url)")
 			panicOnErr(resp.Write(client), "resp.Write(client)")
-			resp.Body.Close()
-			client.Close()
+			_ = resp.Body.Close()
+			_ = client.Close()
 		})
-	client, l := oneShotProxy(proxy, t)
+	client, l := oneShotProxy(proxy)
 	defer l.Close()
 	proxyAddr := l.Listener.Addr().String()
-	conn, err := net.Dial("tcp", proxyAddr)
+	conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", proxyAddr)
 	panicOnErr(err, "conn "+proxyAddr)
 	buf := bufio.NewReader(conn)
 	writeConnect(conn)
@@ -687,18 +718,18 @@ func TestGoproxyHijackConnect(t *testing.T) {
 		t.Error("Expected bobo for CONNECT /foo, got", txt)
 	}
 
-	if r := string(getOrFail(https.URL+"/bobo", client, t)); r != "bobo" {
+	if r := string(getOrFail(t, https.URL+"/bobo", client)); r != "bobo" {
 		t.Error("Expected bobo would keep working with CONNECT", r)
 	}
 }
 
 func readResponse(buf *bufio.Reader) string {
-	req, err := http.NewRequest("GET", srv.URL, nil)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
 	panicOnErr(err, "NewRequest")
 	resp, err := http.ReadResponse(buf, req)
 	panicOnErr(err, "resp.Read")
 	defer resp.Body.Close()
-	txt, err := ioutil.ReadAll(resp.Body)
+	txt, err := io.ReadAll(resp.Body)
 	panicOnErr(err, "resp.Read")
 	return string(txt)
 }
@@ -709,33 +740,41 @@ func writeConnect(w io.Writer) {
 	// Passing IP address with port alone (without //) will raise error:
 	// "first path segment in URL cannot contain colon" more details on this
 	// here: https://github.com/golang/go/issues/18824
-	validSrvURL := srv.URL[len("http:"):]
-
-	req, err := http.NewRequest("CONNECT", validSrvURL, nil)
-	panicOnErr(err, "NewRequest")
-	req.Write(w)
+	req := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: srv.Listener.Addr().String()},
+		Host:   srv.Listener.Addr().String(),
+		Header: make(http.Header),
+	}
+	err := req.Write(w)
 	panicOnErr(err, "req(CONNECT).Write")
 }
 
 func TestCurlMinusP(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.OnRequest().HandleConnectFunc(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
-		return goproxy.HTTPMitmConnect, host
+		return goproxy.MitmConnect, host
 	})
 	called := false
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		called = true
 		return req, nil
 	})
-	_, l := oneShotProxy(proxy, t)
+	_, l := oneShotProxy(proxy)
 	defer l.Close()
-	cmd := exec.Command("curl", "-p", "-sS", "--proxy", l.URL, srv.URL+"/bobo")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "curl", "-p", "-sS", "--proxy", l.URL, srv.URL+"/bobo")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
 		t.Fatal(err)
 	}
-	if string(output) != "bobo" {
-		t.Error("Expected bobo, got", string(output))
+
+	if output := out.String(); output != "bobo" {
+		t.Error("Expected bobo, got", output)
 	}
 	if !called {
 		t.Error("handler not called")
@@ -744,15 +783,16 @@ func TestCurlMinusP(t *testing.T) {
 
 func TestSelfRequest(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
-	_, l := oneShotProxy(proxy, t)
+	_, l := oneShotProxy(proxy)
 	defer l.Close()
-	if !strings.Contains(string(getOrFail(l.URL, http.DefaultClient, t)), "non-proxy") {
+	if !strings.Contains(string(getOrFail(t, l.URL, &http.Client{})), "non-proxy") {
 		t.Fatal("non proxy requests should fail")
 	}
 }
 
 func TestHasGoproxyCA(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
+	proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 	s := httptest.NewServer(proxy)
 
@@ -763,7 +803,7 @@ func TestHasGoproxyCA(t *testing.T) {
 	tr := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: goproxyCA}, Proxy: http.ProxyURL(proxyUrl)}
 	client := &http.Client{Transport: tr}
 
-	if resp := string(getOrFail(https.URL+"/bobo", client, t)); resp != "bobo" {
+	if resp := string(getOrFail(t, https.URL+"/bobo", client)); resp != "bobo" {
 		t.Error("Wrong response when mitm", resp, "expected bobo")
 	}
 }
@@ -779,14 +819,14 @@ func (tcs *TestCertStorage) Fetch(hostname string, gen func() (*tls.Certificate,
 	var err error
 	cert, ok := tcs.certs[hostname]
 	if ok {
-		fmt.Printf("hit %v\n", cert == nil)
+		log.Printf("hit %v\n", cert == nil)
 		tcs.hits++
 	} else {
 		cert, err = gen()
 		if err != nil {
 			return nil, err
 		}
-		fmt.Printf("miss %v\n", cert == nil)
+		log.Printf("miss %v\n", cert == nil)
 		tcs.certs[hostname] = cert
 		tcs.misses++
 	}
@@ -812,11 +852,16 @@ func TestProxyWithCertStorage(t *testing.T) {
 	tcs := newTestCertStorage()
 	t.Logf("TestProxyWithCertStorage started")
 	proxy := goproxy.NewProxyHttpServer()
+	proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	proxy.CertStore = tcs
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		req.URL.Path = "/bobo"
 		return req, nil
+	})
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		resp.Close = true
+		return resp
 	})
 
 	s := httptest.NewServer(proxy)
@@ -828,7 +873,7 @@ func TestProxyWithCertStorage(t *testing.T) {
 	tr := &http.Transport{TLSClientConfig: &tls.Config{RootCAs: goproxyCA}, Proxy: http.ProxyURL(proxyUrl)}
 	client := &http.Client{Transport: tr}
 
-	if resp := string(getOrFail(https.URL+"/bobo", client, t)); resp != "bobo" {
+	if resp := string(getOrFail(t, https.URL+"/bobo", client)); resp != "bobo" {
 		t.Error("Wrong response when mitm", resp, "expected bobo")
 	}
 
@@ -840,7 +885,7 @@ func TestProxyWithCertStorage(t *testing.T) {
 	}
 
 	// Another round - this time the certificate can be loaded
-	if resp := string(getOrFail(https.URL+"/bobo", client, t)); resp != "bobo" {
+	if resp := string(getOrFail(t, https.URL+"/bobo", client)); resp != "bobo" {
 		t.Error("Wrong response when mitm", resp, "expected bobo")
 	}
 
@@ -884,11 +929,11 @@ func TestHttpsMitmURLRewrite(t *testing.T) {
 				return nil, goproxy.TextResponse(req, "Dummy response")
 			})
 
-		client, s := oneShotProxy(proxy, t)
+		client, s := oneShotProxy(proxy)
 		defer s.Close()
 
 		fullURL := scheme + "://" + tc.Host + tc.RawPath
-		req, err := http.NewRequest("GET", fullURL, nil)
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, fullURL, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -899,13 +944,12 @@ func TestHttpsMitmURLRewrite(t *testing.T) {
 		}
 
 		resp, err := client.Do(req)
-
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		b, err := ioutil.ReadAll(resp.Body)
-		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -926,10 +970,11 @@ func TestSimpleHttpRequest(t *testing.T) {
 
 	var server *http.Server
 	go func() {
-		fmt.Println("serving end proxy server at localhost:5000")
+		t.Log("serving end proxy server at localhost:5000")
 		server = &http.Server{
-			Addr:    "localhost:5000",
-			Handler: proxy,
+			Addr:              "localhost:5000",
+			Handler:           proxy,
+			ReadHeaderTimeout: 10 * time.Second,
 		}
 		err := server.ListenAndServe()
 		if err == nil {
@@ -946,13 +991,24 @@ func TestSimpleHttpRequest(t *testing.T) {
 	}
 	client := http.Client{Transport: tr}
 
-	resp, err := client.Get("http://example.com")
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.com", nil)
+	if err != nil {
+		t.Fatal("Cannot create request", err)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Error("Error requesting http site", err)
-	} else if resp.StatusCode != 200 {
+	} else if resp.StatusCode != http.StatusOK {
 		t.Error("Non-OK status requesting http site", err)
 	}
-	resp, _ = client.Get("http://example.invalid")
+
+	req, err = http.NewRequestWithContext(context.Background(), http.MethodGet, "http://example.invalid", nil)
+	if err != nil {
+		t.Fatal("Cannot create request", err)
+	}
+
+	resp, _ = client.Do(req)
 	if resp == nil {
 		t.Error("No response requesting invalid http site")
 	}
@@ -962,12 +1018,12 @@ func TestSimpleHttpRequest(t *testing.T) {
 	}
 	proxy.OnResponse(goproxy.UrlMatches(regexp.MustCompile(".*"))).DoFunc(returnNil)
 
-	resp, _ = client.Get("http://example.invalid")
+	resp, _ = client.Do(req)
 	if resp == nil {
 		t.Error("No response requesting invalid http site")
 	}
 
-	server.Shutdown(context.TODO())
+	_ = server.Shutdown(context.TODO())
 }
 
 func TestResponseContentLength(t *testing.T) {
@@ -981,24 +1037,25 @@ func TestResponseContentLength(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 		buf := &bytes.Buffer{}
-		buf.Write([]byte("change"))
-		resp.Body = ioutil.NopCloser(buf)
+		buf.WriteString("change")
+		resp.Body = io.NopCloser(buf)
 		return resp
 	})
 	proxySrv := httptest.NewServer(proxy)
 	defer proxySrv.Close()
 
 	// send request
-	http.DefaultClient.Transport = &http.Transport{
+	client := &http.Client{}
+	client.Transport = &http.Transport{
 		Proxy: func(req *http.Request) (*url.URL, error) {
 			return url.Parse(proxySrv.URL)
 		},
 	}
-	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
-	resp, _ := http.DefaultClient.Do(req)
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	resp, _ := client.Do(req)
 
-	body, _ := ioutil.ReadAll(resp.Body)
-	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
 
 	if int64(len(body)) != resp.ContentLength {
 		t.Logf("response body: %s", string(body))
@@ -1006,4 +1063,639 @@ func TestResponseContentLength(t *testing.T) {
 		t.Logf("response Content-Length: %d", resp.ContentLength)
 		t.Fatalf("Wrong response Content-Length.")
 	}
+}
+
+func TestHeaderMultipleValues(t *testing.T) {
+	// target server
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Test", "1")
+	}))
+	defer srv.Close()
+
+	// proxy server
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		resp.Header.Add("Test", "2")
+		return resp
+	})
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	// send request
+	client := &http.Client{}
+	client.Transport = &http.Transport{
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			return url.Parse(proxySrv.URL)
+		},
+	}
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	resp, _ := client.Do(req)
+
+	assert.Len(t, resp.Header["Test"], 2)
+	assert.Contains(t, resp.Header["Test"], "1")
+	assert.Contains(t, resp.Header["Test"], "2")
+}
+
+func TestMITMResponseHTTP2MissingContentLength(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			// Force missing Content-Length
+			f.Flush()
+		}
+		_, _ = w.Write([]byte("HTTP/2 response"))
+	})
+
+	// Explicitly make an HTTP/2 server
+	srv := httptest.NewUnstartedServer(handler)
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	// proxy server
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		// Connection between the proxy client and the proxy server
+		assert.Equal(t, "HTTP/1.1", req.Proto)
+		return req, nil
+	})
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		// Connection between the proxy server and the origin
+		assert.Equal(t, "HTTP/2.0", resp.Proto)
+		return resp
+	})
+
+	// Configure proxy transport to use HTTP/2 to communicate with the server
+	proxy.Tr = &http.Transport{
+		ForceAttemptHTTP2: true,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2"},
+		},
+	}
+
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				return url.Parse(proxySrv.URL)
+			},
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+
+	assert.EqualValues(t, -1, resp.ContentLength)
+	assert.Equal(t, []string{"chunked"}, resp.TransferEncoding)
+	assert.Len(t, body, 15)
+}
+
+func TestMITMResponseContentLength(t *testing.T) {
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		// Don't touch the body at all
+		return resp
+	})
+
+	client, l := oneShotProxy(proxy)
+	defer l.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, https.URL+"/bobo", nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.EqualValues(t, len(body), resp.ContentLength)
+}
+
+func TestMITMEmptyBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(nil)
+	}))
+	defer srv.Close()
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		return resp
+	})
+
+	client, l := oneShotProxy(proxy)
+	defer l.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.EqualValues(t, 0, resp.ContentLength)
+}
+
+func TestMITMNoContentResponse(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	client, l := oneShotProxy(proxy)
+	defer l.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, http.StatusNotModified, resp.StatusCode)
+	assert.NotContains(t, resp.TransferEncoding, "chunked")
+}
+
+func TestMITMOverwriteAlreadyEmptyBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(nil)
+	}))
+	defer srv.Close()
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		assert.EqualValues(t, 0, resp.ContentLength)
+		resp.Body = io.NopCloser(bytes.NewReader(nil))
+		return resp
+	})
+
+	client, l := oneShotProxy(proxy)
+	defer l.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.EqualValues(t, 0, resp.ContentLength)
+}
+
+func TestMITMOverwriteBodyToEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("test"))
+	}))
+	defer srv.Close()
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		assert.EqualValues(t, 4, resp.ContentLength)
+		resp.Body = io.NopCloser(bytes.NewReader(nil))
+		return resp
+	})
+
+	client, l := oneShotProxy(proxy)
+	defer l.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.EqualValues(t, 0, resp.ContentLength)
+}
+
+func TestMITMRequestCancel(t *testing.T) {
+	// target server
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("hello world"))
+	}))
+	defer srv.Close()
+
+	// proxy server
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	var request *http.Request
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		request = req
+		return req, nil
+	})
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	// send request
+	client := &http.Client{}
+	client.Transport = &http.Transport{
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			return url.Parse(proxySrv.URL)
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	require.NoError(t, err)
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, "hello world", string(body))
+	assert.NotNil(t, request)
+
+	select {
+	case _, ok := <-request.Context().Done():
+		assert.False(t, ok)
+	default:
+		assert.Fail(t, "request hasn't been cancelled")
+	}
+}
+
+func TestNewResponseProtoVersion(t *testing.T) {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com/", nil)
+	require.NoError(t, err)
+
+	resp := goproxy.NewResponse(req, goproxy.ContentTypeText, http.StatusForbidden, "blocked")
+
+	assert.Equal(t, "HTTP/1.1", resp.Proto)
+	assert.Equal(t, 1, resp.ProtoMajor)
+	assert.Equal(t, 1, resp.ProtoMinor)
+
+	var buf bytes.Buffer
+	err = resp.Write(&buf)
+	require.NoError(t, err)
+
+	line, err := buf.ReadString('\n')
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(line, "HTTP/1.1 403"), "expected HTTP/1.1 status line, got: %s", line)
+}
+
+func TestNewResponseMitmWrite(t *testing.T) {
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		return nil, goproxy.NewResponse(req, goproxy.ContentTypeText, http.StatusForbidden, "blocked")
+	})
+
+	client, l := oneShotProxy(proxy)
+	defer l.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, https.URL+"/anything", nil)
+	require.NoError(t, err)
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Equal(t, "blocked", string(body))
+}
+
+func TestPersistentMitmRequest(t *testing.T) {
+	requestCount := 0
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, "Request number %d", requestCount)
+		requestCount++
+	}))
+	defer backend.Close()
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+
+	proxyURL, err := url.Parse(proxyServer.URL)
+	require.NoError(t, err)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+			// We disable HTTP/2 to make sure to test HTTP/1.1 Keep-Alive
+			ForceAttemptHTTP2: false,
+		},
+	}
+
+	for i := 0; i < 2; i++ {
+		var connReused bool
+		trace := &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				connReused = info.Reused
+			},
+		}
+
+		ctx := httptrace.WithClientTrace(context.Background(), trace)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, backend.URL, nil)
+		require.NoError(t, err)
+
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+
+		assert.Equal(t, fmt.Sprintf("Request number %d", i), string(body))
+
+		// First request creates the connection, second request reuses it
+		switch i {
+		case 0:
+			assert.False(t, connReused)
+		case 1:
+			assert.True(t, connReused)
+		}
+	}
+}
+
+func TestMITMResponseHTTP2ProtoVersion(t *testing.T) {
+	// Upstream HTTP/2 server
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("hello"))
+	})
+	srv := httptest.NewUnstartedServer(handler)
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	// Proxy with MITM and HTTP/2 upstream transport
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.Tr = &http.Transport{
+		ForceAttemptHTTP2: true,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2"},
+		},
+	}
+
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	// Client talks HTTP/1.1 through the MITM proxy
+	proxyURL, _ := url.Parse(proxySrv.URL)
+	conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", proxyURL.Host)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Send CONNECT
+	connectReq, _ := http.NewRequestWithContext(context.Background(), http.MethodConnect, srv.URL, nil)
+	require.NoError(t, connectReq.Write(conn))
+	br := bufio.NewReader(conn)
+	connectResp, err := http.ReadResponse(br, connectReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, connectResp.StatusCode)
+
+	// TLS handshake with the MITM'd proxy
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	require.NoError(t, tlsConn.HandshakeContext(context.Background()))
+
+	// Send an HTTP/1.1 request through the tunnel
+	httpReq, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/test", nil)
+	require.NoError(t, httpReq.Write(tlsConn))
+
+	// Read response — must be HTTP/1.x, not HTTP/2.0
+	tlsBr := bufio.NewReader(tlsConn)
+	resp, err := http.ReadResponse(tlsBr, httpReq)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, "hello", string(body))
+	assert.Equal(t, 1, resp.ProtoMajor,
+		"MITM'd client should receive HTTP/1.x response, got %s", resp.Proto)
+}
+
+// TestTrailersForwarded verifies that response trailers (e.g. gRPC's
+// grpc-status, grpc-message) emitted by the upstream server are forwarded
+// through the proxy to the client.
+//
+// Regression test for https://github.com/elazarl/goproxy/issues/408
+// ("Proxying grpc/h2c requests fail with 'server closed the stream
+// without sending trailers'").
+func TestTrailersForwarded(t *testing.T) {
+	const (
+		bodyText     = "hello world"
+		announcedKey = "Grpc-Status"
+		announcedVal = "0"
+		unannouncedK = "X-Late-Trailer"
+		unannouncedV = "abc"
+	)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Pre-announce one trailer (h1 chunked path).
+		w.Header().Set("Trailer", announcedKey)
+		w.Header().Set("Content-Type", "application/grpc")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, bodyText)
+		// Pre-announced: value goes under the unprefixed key.
+		w.Header().Set(announcedKey, announcedVal)
+		// Late / unannounced: must use TrailerPrefix on the upstream,
+		// which httputil-style proxy code paths must forward via
+		// TrailerPrefix on the client side too.
+		w.Header().Set(http.TrailerPrefix+unannouncedK, unannouncedV)
+	}))
+	defer upstream.Close()
+
+	client, proxySrv := oneShotProxy(goproxy.NewProxyHttpServer())
+	defer proxySrv.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, upstream.URL+"/anything", nil)
+	require.NoError(t, err)
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, bodyText, string(body))
+
+	// resp.Trailer is only populated after the body is fully consumed.
+	require.Equal(t, announcedVal, resp.Trailer.Get(announcedKey),
+		"upstream pre-announced trailer should be forwarded by the proxy")
+	require.Equal(t, unannouncedV, resp.Trailer.Get(unannouncedK),
+		"upstream late/unannounced trailer should be forwarded by the proxy")
+}
+
+// TestNoTrailersUnchanged is a sanity check that responses without trailers
+// are unaffected by the trailer-forwarding code.
+func TestNoTrailersUnchanged(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer upstream.Close()
+
+	client, proxySrv := oneShotProxy(goproxy.NewProxyHttpServer())
+	defer proxySrv.Close()
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, upstream.URL+"/", nil)
+	require.NoError(t, err)
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, "ok", strings.TrimSpace(string(body)))
+	require.Empty(t, resp.Trailer)
+}
+
+// TestTransparentTunnelClosesClientConnOnTargetError verifies that when the
+// target connection closes unexpectedly during a transparent TCP tunnel
+// (ConnectAccept path), the client connection is also closed so the client
+// doesn't hang indefinitely.
+//
+// Regression test for https://github.com/elazarl/goproxy/issues/657
+func TestTransparentTunnelClosesClientConnOnTargetError(t *testing.T) {
+	// Target server: closes connection immediately after reading from client.
+	// This simulates a target IO error (timeout, connection reset).
+	targetListener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer targetListener.Close()
+
+	targetConnCh := make(chan net.Conn, 1)
+	go func() {
+		conn, err := targetListener.Accept()
+		if err != nil {
+			return
+		}
+		targetConnCh <- conn
+	}()
+
+	// Proxy server: transparent tunnel (ConnectAccept, the default).
+	// No HandleConnect handler means OkConnect (transparent tunnel) is used.
+	proxy := goproxy.NewProxyHttpServer()
+
+	proxyServer := httptest.NewServer(proxy)
+	defer proxyServer.Close()
+
+	proxyURL, err := url.Parse(proxyServer.URL)
+	require.NoError(t, err)
+
+	// Connect to proxy.
+	clientConn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", proxyURL.Host)
+	require.NoError(t, err)
+	defer clientConn.Close()
+
+	// Send CONNECT request.
+	connectReq := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: targetListener.Addr().String()},
+		Host:   targetListener.Addr().String(),
+		Header: make(http.Header),
+	}
+	require.NoError(t, connectReq.Write(clientConn))
+
+	// Read CONNECT response.
+	br := bufio.NewReader(clientConn)
+	connectResp, err := http.ReadResponse(br, connectReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, connectResp.StatusCode)
+
+	// Wait for target to accept connection.
+	var targetConn net.Conn
+	select {
+	case targetConn = <-targetConnCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for target connection")
+	}
+
+	// Send data through the tunnel so the target starts reading.
+	_, err = clientConn.Write([]byte("hello"))
+	require.NoError(t, err)
+
+	// Target closes connection (simulates IO error).
+	require.NoError(t, targetConn.Close())
+
+	// Verify client connection is closed within timeout.
+	done := make(chan struct{})
+	go func() {
+		buf := make([]byte, 1024)
+		_, _ = clientConn.Read(buf)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Connection was closed — this is the expected behavior.
+	case <-time.After(3 * time.Second):
+		t.Fatal("client connection was not closed after target closed; client would hang indefinitely")
+	}
+}
+
+// TestMitmConnectNormalizesDefaultPortInURL verifies that when a client sends a CONNECT
+// request with a default port (e.g., example.com:443), but the inner HTTP/1.1 request
+// contains a Host header without the port (e.g., Host: example.com), the proxy
+// normalizes req.URL.Host to match the inner Host header.
+//
+// Regression test for URL normalization during MITM interception.
+func TestMitmConnectNormalizesDefaultPortInURL(t *testing.T) {
+	proxy := goproxy.NewProxyHttpServer()
+
+	var capturedReq *http.Request
+
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		capturedReq = req
+		// Return a synthetic response to avoid a real network request to example.com
+		return nil, goproxy.TextResponse(req, "ok")
+	})
+
+	client, l := oneShotProxy(proxy)
+	defer l.Close()
+
+	proxyURL, _ := url.Parse(l.URL)
+	tr := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		// Forcefully disable HTTP/2 on the client to guarantee the use of the CONNECT method (HTTP/1.1).
+		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+	}
+	client.Transport = tr
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com/bobo", nil)
+	require.NoError(t, err)
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.NotNil(t, capturedReq, "Request was not captured by the OnRequest hook")
+	require.NotNil(t, capturedReq.URL, "capturedReq.URL is nil")
+
+	assert.Equal(t, "example.com", capturedReq.URL.Host,
+		"Expected req.URL.Host to be normalized to 'example.com' without ':443'")
+
+	urlStr := capturedReq.URL.String()
+	assert.NotContains(t, urlStr, ":443",
+		"Expected req.URL.String() to not contain ':443'")
 }
